@@ -2,7 +2,7 @@
 Effectiveness calendar bot for Max application
 
 # **Примерная** архитектура по папкам  
-/max-reminder-bot/<br>
+/FunWorldHackathon/<br>
 │<br>
 ├── bot-service/                # Python бот (MAX API)<br>
 │   ├── app/<br>
