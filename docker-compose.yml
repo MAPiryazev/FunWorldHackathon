@@ -43,7 +43,7 @@ services:
       - REDIS_HOST=reminder-redis
       - REDIS_PORT=6379
     ports:
-      - "8080:8080"
+      - "8907:8907"
     volumes:
       - ./.env:/app/.env:ro
     depends_on:
