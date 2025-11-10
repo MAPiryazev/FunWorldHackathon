@@ -25,7 +25,6 @@ type Server struct {
 	notificationSvc *service.NotificationService
 }
 
-// TODO вот тут нормальный путь подставить
 func InitNotificationService(envPath string) (*service.NotificationService, error) {
 	rabbitCfg, err := config.LoadRabbitMQConfig(envPath)
 	if err != nil {
