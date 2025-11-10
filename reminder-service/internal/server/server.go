@@ -10,49 +10,45 @@ import (
 	"syscall"
 	"time"
 
-	"L3.1/internal/config"
-	"L3.1/internal/handlers"
-	"L3.1/internal/infrastructure"
-	"L3.1/internal/notifier"
-	"L3.1/internal/service"
+	"reminder-service/internal/config"
+	"reminder-service/internal/handlers"
+	"reminder-service/internal/infrastructure"
+	"reminder-service/internal/sender"
+	"reminder-service/internal/service"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-// Server представляет HTTP сервер
 type Server struct {
 	httpServer      *http.Server
 	notificationSvc *service.NotificationService
 }
 
-// InitNotificationService инициализация
-func InitNotificationService() (*service.NotificationService, error) {
-	rabbitCfg, err := config.LoadRabbitMQConfig("../../environment/.env")
+// TODO вот тут нормальный путь подставить
+func InitNotificationService(envPath string) (*service.NotificationService, error) {
+	rabbitCfg, err := config.LoadRabbitMQConfig(envPath)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка загрузки конфига RabbitMQ: %w", err)
 	}
 
-	redisClient := infrastructure.NewRedisClient("localhost:6379", "", 0)
+	redisCfg, err := config.LoadRedisConfig(envPath)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка загрузки конфига Redis: %w", err)
+	}
 
-	rabbitMQClient, err := infrastructure.NewRabbitMQClient(*rabbitCfg)
+	redisClient := infrastructure.NewRedisClient(redisCfg)
+	rabbitMQClient, err := infrastructure.NewRabbitMQClient(rabbitCfg)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка подключения к RabbitMQ: %w", err)
 	}
 
-	gmailConfig, err := config.LoadGmaiLConfig("../../environment/.env")
-	if err != nil {
-		return nil, fmt.Errorf("ошибка загрузки конфига Gmail: %w", err)
-	}
-
-	gmailNotifier, err := notifier.NewGmailNotifier(gmailConfig.From, gmailConfig.Password)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка создания Gmail нотификатора: %w", err)
-	}
+	logSender := sender.NewLogSender()
 
 	notificationService, err := service.NewNotificationService(
 		redisClient,
 		rabbitMQClient,
-		gmailNotifier,
+		logSender,
 		"delayed_queue",
 		"ready_queue",
 	)
@@ -63,7 +59,6 @@ func InitNotificationService() (*service.NotificationService, error) {
 	return notificationService, nil
 }
 
-// NewServer создает новый сервер
 func NewServer(addr string, notificationSvc *service.NotificationService) *Server {
 	handler := handlers.NewDefaultHandler(notificationSvc)
 
@@ -75,10 +70,11 @@ func NewServer(addr string, notificationSvc *service.NotificationService) *Serve
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
 
-	r.Route("/notify", func(r chi.Router) {
-		r.Post("/", handler.CreateNotificationHandler)
-		r.Get("/status", handler.GetStatusHandler)
-		r.Delete("/cancel", handler.CancelNotificationHandler)
+	r.Route("/tasks", func(r chi.Router) {
+		r.Post("/", handler.CreateTaskHandler)                 // POST /tasks
+		r.Get("/", handler.ListTasksHandler)                   // GET /tasks?user_id=...&status=...&category=...
+		r.Get("/{task_id}", handler.GetTaskStatusHandler)      // GET /tasks/{task_id}
+		r.Post("/{task_id}/cancel", handler.CancelTaskHandler) // POST /tasks/{task_id}/cancel
 	})
 
 	srv := &http.Server{
@@ -92,39 +88,38 @@ func NewServer(addr string, notificationSvc *service.NotificationService) *Serve
 	}
 }
 
-// Start запускает сервер и фоновые воркеры
 func (s *Server) Start() {
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	go func() {
-		log.Println("Запуск Delayed Worker...")
+		log.Println("[Server] Запуск Delayed Worker...")
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("Delayed Worker упал: %v", r)
+				log.Printf("[Server] Delayed Worker упал: %v", r)
 			}
 		}()
 		if err := s.notificationSvc.StartDelayedWorker(ctx); err != nil && err != context.Canceled {
-			log.Printf("Ошибка delayed воркера: %v", err)
+			log.Printf("[Server] Ошибка delayed воркера: %v", err)
 		}
 	}()
 
 	go func() {
-		log.Println("Запуск Ready Worker...")
+		log.Println("[Server] Запуск Ready Worker...")
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("Ready Worker упал: %v", r)
+				log.Printf("[Server] Ready Worker упал: %v", r)
 			}
 		}()
-		if err := s.notificationSvc.StartWorker(ctx); err != nil && err != context.Canceled {
-			log.Printf("Ошибка ready воркера: %v", err)
+		if err := s.notificationSvc.StartReadyWorker(ctx); err != nil && err != context.Canceled {
+			log.Printf("[Server] Ошибка ready воркера: %v", err)
 		}
 	}()
 
-	// Запускаем HTTP сервер
 	go func() {
-		log.Printf("Сервер запущен на порту %s", s.httpServer.Addr)
+		log.Printf("[Server] HTTP сервер запущен на %s", s.httpServer.Addr)
 		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("ошибка запуска сервера: %v", err)
+			log.Fatalf("[Server] Ошибка запуска сервера: %v", err)
 		}
 	}()
 
@@ -132,14 +127,15 @@ func (s *Server) Start() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("Завершение работы сервера")
+	log.Println("[Server] Завершение работы сервера...")
 	cancel() // отменяем контекст для воркеров
+
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
 	if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("ошибка при остановке сервера: %v", err)
+		log.Printf("[Server] Ошибка при остановке сервера: %v", err)
 	}
 
-	log.Println("Сервер остановлен корректно")
+	log.Println("[Server] Сервер остановлен корректно")
 }

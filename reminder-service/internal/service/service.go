@@ -2,226 +2,382 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
 	"time"
 
-	"L3.1/internal/infrastructure"
-	"L3.1/internal/models"
+	"reminder-service/internal/infrastructure"
+	"reminder-service/internal/models"
+	"reminder-service/internal/sender"
+
 	"github.com/google/uuid"
 )
 
-// Notifier — интерфейс, через который мы отправляем уведомления (например, Gmail)
-type Notifier interface {
-	Send(ctx context.Context, msg *models.RabbitMQMessage) error
+// NotificationService — интерфейс для работы с напоминаниями
+type NotificationServiceIface interface {
+	CreateTask(ctx context.Context, req *models.CreateNotificationRequest) (*models.RabbitMQMessage, error)
+	CancelTask(ctx context.Context, id string) error
+	GetTaskStatus(ctx context.Context, id string) (*models.RedisMessage, error)
+	ExtendTaskDeadline(ctx context.Context, id string, newTime time.Time) error
+	ListTasksByUser(ctx context.Context, userID string) ([]*models.RedisMessage, error)
 }
 
 // NotificationService — основной сервис для создания, отмены и обработки уведомлений
 type NotificationService struct {
-	cache            infrastructure.CacheClient
-	queue            infrastructure.QueueMQClient
-	notifier         Notifier
+	cache            infrastructure.CacheClientIface
+	queue            infrastructure.QueueRepositoryIface
+	sender           sender.SenderIface
 	queueNameDelayed string
 	queueNameReady   string
-
 	retryBaseSeconds int
 	maxRetries       int
 }
 
 // NewNotificationService — конструктор сервиса
 func NewNotificationService(
-	cache infrastructure.CacheClient,
-	queue infrastructure.QueueMQClient,
-	notifier Notifier,
+	cache infrastructure.CacheClientIface,
+	queue infrastructure.QueueRepositoryIface,
+	sender sender.SenderIface,
 	delayedQueue string,
 	readyQueue string,
 ) (*NotificationService, error) {
-	if cache == nil || queue == nil || notifier == nil {
-		return nil, fmt.Errorf("не все зависимости переданы в конструктор")
+	if cache == nil {
+		return nil, fmt.Errorf("Redis клиент не передан в конструктор")
+	}
+	if queue == nil {
+		return nil, fmt.Errorf("RabbitMQ клиент не передан в конструктор")
+	}
+	if sender == nil {
+		return nil, fmt.Errorf("Sender не передан в конструктор")
+	}
+	if delayedQueue == "" || readyQueue == "" {
+		return nil, fmt.Errorf("названия очередей не могут быть пустыми")
 	}
 
 	return &NotificationService{
 		cache:            cache,
 		queue:            queue,
-		notifier:         notifier,
-		queueNameReady:   readyQueue,
+		sender:           sender,
 		queueNameDelayed: delayedQueue,
+		queueNameReady:   readyQueue,
 		retryBaseSeconds: 2,
 		maxRetries:       5,
 	}, nil
 }
 
-// CreateNotification — создаёт новое уведомление
-func (ns *NotificationService) CreateNotification(ctx context.Context, to, subject, body string, sendAt time.Time) (string, error) {
-	id := uuid.New().String()
+// CreateTask — создаёт новую задачу/напоминание
+func (s *NotificationService) CreateTask(
+	ctx context.Context,
+	req *models.CreateNotificationRequest,
+) (*models.RabbitMQMessage, error) {
 
-	rabbitMsg := &models.RabbitMQMessage{
-		ID:         id,
-		To:         to,
-		Subject:    subject,
-		Body:       body,
-		SendAt:     sendAt,
+	if req == nil {
+		return nil, fmt.Errorf("запрос не может быть nil")
+	}
+	if len(req.UserID) == 0 {
+		return nil, fmt.Errorf("UserID обязателен")
+	}
+	if len(req.Text) == 0 {
+		return nil, fmt.Errorf("текст уведомления обязателен")
+	}
+	if req.RemindAt.Before(time.Now()) {
+		return nil, fmt.Errorf("время напоминания не может быть в прошлом")
+	}
+	if req.Complexity < 1 || req.Complexity > 5 {
+		req.Complexity = 1
+	}
+
+	now := time.Now()
+
+	msg := &models.RabbitMQMessage{
+		ID:         uuid.NewString(),
+		UserID:     req.UserID,
+		Text:       req.Text,
+		RemindAt:   req.RemindAt,
+		Status:     "pending",
 		RetryCount: 0,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Complexity: req.Complexity,
+		Priority:   req.Priority,
+		Category:   req.Category,
+		Notes:      req.Notes,
 	}
 
 	redisMsg := &models.RedisMessage{
-		ID:        id,
-		Status:    "scheduled",
-		UpdatedAt: time.Now(),
+		ID:         msg.ID,
+		UserID:     req.UserID,
+		Text:       req.Text,
+		RemindAt:   req.RemindAt,
+		Status:     msg.Status,
+		RetryCount: msg.RetryCount,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Error:      "",
+		Complexity: msg.Complexity,
+		Priority:   msg.Priority,
+		Category:   msg.Category,
+		Notes:      msg.Notes,
+	}
+	if err := s.cache.Save(ctx, redisMsg); err != nil {
+		return nil, fmt.Errorf("не удалось сохранить задачу в Redis: %w", err)
 	}
 
-	if err := ns.cache.Set(ctx, id, redisMsg); err != nil {
-		return "", fmt.Errorf("ошибка при добавлении в кэш: %w", err)
+	if err := s.queue.PublishDelayed(ctx, msg); err != nil {
+		// При ошибке публикации лучше удалить запись из Redis
+		_ = s.cache.Delete(ctx, msg.ID)
+		return nil, fmt.Errorf("не удалось отправить задачу в очередь delayed: %w", err)
 	}
 
-	delay := time.Until(sendAt)
-	if delay <= 0 {
-		// если время отправки уже наступило — публикуем сразу
-		if err := ns.queue.Publish(ctx, ns.queueNameReady, rabbitMsg); err != nil {
-			return id, fmt.Errorf("немедленная отправка не удалась: %w", err)
-		}
-		return id, nil
-	}
-
-	// публикуем в отложенную очередь
-	if err := ns.queue.Publish(ctx, ns.queueNameDelayed, rabbitMsg); err != nil {
-		return id, fmt.Errorf("отложенная отправка не удалась: %w", err)
-	}
-
-	return id, nil
+	return msg, nil
 }
 
-// GetStatus — получение статуса уведомления из Redis
-func (ns *NotificationService) GetStatus(ctx context.Context, messageID string) (*models.RedisMessage, error) {
-	return ns.cache.Get(ctx, messageID)
-}
+// CancelTask — отменяет задачу по ID
+func (s *NotificationService) CancelTask(ctx context.Context, id string) error {
+	if len(id) == 0 {
+		return fmt.Errorf("ID задачи обязателен")
+	}
 
-// CancelNotification — отменяет уведомление
-func (ns *NotificationService) CancelNotification(ctx context.Context, messageID string) error {
-	redisMessage, err := ns.cache.Get(ctx, messageID)
+	exists, err := s.cache.Exists(ctx, id)
 	if err != nil {
-		return fmt.Errorf("не удалось получить сообщение из Redis: %w", err)
+		return fmt.Errorf("ошибка проверки задачи в Redis: %w", err)
 	}
-	if redisMessage == nil {
-		return fmt.Errorf("сообщение с ID %s не найдено", messageID)
-	}
-	if redisMessage.Status == "canceled" {
-		return fmt.Errorf("сообщение уже было отменено")
+	if !exists {
+		return fmt.Errorf("задача с ID %s не найдена", id)
 	}
 
-	cancelMsg := &models.RedisMessage{
-		ID:        redisMessage.ID,
-		Status:    "canceled",
-		UpdatedAt: time.Now(),
+	msg, err := s.cache.Get(ctx, id)
+	if err != nil {
+		return fmt.Errorf("ошибка получения задачи из Redis: %w", err)
 	}
 
-	if err := ns.cache.Set(ctx, cancelMsg.ID, cancelMsg); err != nil {
-		return fmt.Errorf("ошибка при обновлении статуса отмены: %w", err)
+	if msg.Status == "sent" || msg.Status == "cancelled" {
+		return fmt.Errorf("задачу с ID %s нельзя отменить, статус: %s", id, msg.Status)
+	}
+
+	msg.Status = "cancelled"
+	msg.Error = ""
+	msg.UpdatedAt = time.Now()
+
+	if err := s.cache.Save(ctx, msg); err != nil {
+		return fmt.Errorf("не удалось обновить статус задачи в Redis: %w", err)
 	}
 
 	return nil
 }
 
-// StartWorker — запускает воркер для обработки готовых сообщений
-func (ns *NotificationService) StartWorker(ctx context.Context) error {
-	return ns.queue.Consume(ctx, ns.queueNameReady, func(msg *models.RabbitMQMessage) error {
-		return ns.handleMessage(ctx, msg)
-	})
-}
-
-// StartDelayedWorker — запускает воркер для переноса сообщений из delayed в ready очередь
-func (ns *NotificationService) StartDelayedWorker(ctx context.Context) error {
-	ticker := time.NewTicker(5 * time.Second) // проверяем каждые 5 секунд
-	defer ticker.Stop()
-
-	log.Println("Delayed worker запущен")
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("Delayed worker остановлен")
-			return ctx.Err()
-		case <-ticker.C:
-			// Пытаемся получить сообщение из delayed очереди
-			msg, err := ns.queue.ConsumeSingleMessage(ctx, ns.queueNameDelayed)
-			if err != nil {
-				continue // если ошибка или очередь пуста - пропускаем
-			}
-
-			// Проверяем, наступило ли время отправки
-			if time.Now().After(msg.SendAt) || time.Now().Equal(msg.SendAt) {
-				// Время пришло - переносим в ready очередь
-				if err := ns.queue.Publish(ctx, ns.queueNameReady, msg); err != nil {
-					log.Printf("Ошибка при переносе сообщения в ready очередь: %v", err)
-					continue
-				}
-				log.Printf("Сообщение %s перенесено из delayed в ready очередь", msg.ID)
-			} else {
-				// Время еще не пришло - возвращаем сообщение обратно в delayed очередь
-				if err := ns.queue.Publish(ctx, ns.queueNameDelayed, msg); err != nil {
-					log.Printf("Ошибка при возврате сообщения в delayed очередь: %v", err)
-				}
-			}
-		}
+// GetTaskStatus — возвращает текущее состояние задачи по ID
+func (s *NotificationService) GetTaskStatus(ctx context.Context, id string) (*models.RedisMessage, error) {
+	if len(id) == 0 {
+		return nil, fmt.Errorf("ID задачи обязателен")
 	}
-}
 
-// handleMessage — основная логика обработки сообщения
-func (ns *NotificationService) handleMessage(ctx context.Context, msg *models.RabbitMQMessage) error {
-	redisMsg, err := ns.cache.Get(ctx, msg.ID)
+	// Проверяем, есть ли такая задача в Redis
+	exists, err := s.cache.Exists(ctx, id)
 	if err != nil {
-		return fmt.Errorf("ошибка при получении из Redis для id=%s: %w", msg.ID, err)
+		return nil, fmt.Errorf("ошибка при проверке существования задачи: %w", err)
+	}
+	if !exists {
+		return nil, fmt.Errorf("задача с ID %s не найдена", id)
 	}
 
-	// если сообщение было отменено — просто игнорируем
-	if redisMsg.Status == "canceled" {
-		return nil
+	// Получаем саму задачу
+	msg, err := s.cache.Get(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка получения задачи из Redis: %w", err)
 	}
 
-	// пробуем отправить
-	if err := ns.notifier.Send(ctx, msg); err != nil {
-		// достигнут лимит попыток
-		if msg.RetryCount >= ns.maxRetries {
-			failMsg := &models.RedisMessage{
-				ID:        msg.ID,
-				Status:    "failed",
-				UpdatedAt: time.Now(),
+	return msg, nil
+}
+
+// StartReadyWorker — обрабатывает задачи из ready_queue:
+// вызывает sender, обновляет статусы и делает ретраи при ошибках.
+func (s *NotificationService) StartReadyWorker(ctx context.Context) error {
+	log.Println("[ReadyWorker] запущен...")
+
+	handler := func(msg *models.RabbitMQMessage) error {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[ReadyWorker] паника обработана: %v", r)
 			}
-			_ = ns.cache.Set(ctx, msg.ID, failMsg)
+		}()
+
+		if msg == nil {
+			return errors.New("nil сообщение получено")
+		}
+
+		cached, err := s.cache.Get(ctx, msg.ID)
+		if err != nil {
+			log.Printf("[ReadyWorker] задача %s не найдена в Redis: %v", msg.ID, err)
 			return nil
 		}
 
-		// экспоненциальная задержка
-		delaySeconds := int(math.Pow(2, float64(msg.RetryCount))) * ns.retryBaseSeconds
-		msg.RetryCount++
-
-		if err := ns.queue.RetryMessage(ctx, ns.queueNameReady, msg, delaySeconds); err != nil {
-			failMsg := &models.RedisMessage{
-				ID:        msg.ID,
-				Status:    "failed",
-				UpdatedAt: time.Now(),
-			}
-			_ = ns.cache.Set(ctx, msg.ID, failMsg)
-			return fmt.Errorf("ошибка при публикации retry: %w", err)
+		if cached.Status == "cancelled" {
+			log.Printf("[ReadyWorker] задача %s отменена — пропуск", msg.ID)
+			return nil
 		}
 
-		redisMsg.Status = "scheduled"
-		redisMsg.UpdatedAt = time.Now()
-		_ = ns.cache.Set(ctx, msg.ID, redisMsg)
+		// попытка отправки через sender
+		err = s.sender.Send(ctx, msg)
+		if err != nil {
+			msg.RetryCount++
+			cached.Status = "failed"
+			cached.Error = err.Error()
+			cached.RetryCount = msg.RetryCount
+			cached.UpdatedAt = time.Now()
+			_ = s.cache.Save(ctx, cached)
 
-		return fmt.Errorf("ошибка при отправке уведомления: %w", err)
+			if msg.RetryCount <= s.maxRetries {
+				delay := s.retryBaseSeconds * int(math.Pow(2, float64(msg.RetryCount-1)))
+				log.Printf("[ReadyWorker] отправка задачи %s не удалась, повтор через %ds", msg.ID, delay)
+				_ = s.queue.Retry(ctx, msg, delay)
+			} else {
+				log.Printf("[ReadyWorker] задача %s достигла лимита попыток (%d) — failed", msg.ID, s.maxRetries)
+			}
+			return err
+		}
+
+		// успешная отправка
+		cached.Status = "sent"
+		cached.Error = ""
+		cached.RetryCount = msg.RetryCount
+		cached.UpdatedAt = time.Now()
+		if err := s.cache.Save(ctx, cached); err != nil {
+			log.Printf("[ReadyWorker] ошибка сохранения статуса sent в Redis: %v", err)
+		}
+
+		log.Printf("[ReadyWorker] задача %s успешно отправлена", msg.ID)
+		return nil
 	}
 
-	// успешно отправлено
-	done := &models.RedisMessage{
-		ID:        msg.ID,
-		Status:    "sent",
-		UpdatedAt: time.Now(),
-	}
-	if err := ns.cache.Set(ctx, msg.ID, done); err != nil {
-		return fmt.Errorf("ошибка при обновлении статуса после отправки: %w", err)
+	return s.queue.ConsumeReady(ctx, handler)
+}
+
+// StartDelayedWorker — переносит задачи из delayed_queue в ready_queue,
+// когда наступает время RemindAt.
+func (s *NotificationService) StartDelayedWorker(ctx context.Context) error {
+	log.Println("[DelayedWorker] запущен...")
+
+	handler := func(msg *models.RabbitMQMessage) error {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[DelayedWorker] паника обработана: %v", r)
+			}
+		}()
+
+		if msg == nil {
+			return errors.New("получено пустое сообщение")
+		}
+
+		cached, err := s.cache.Get(ctx, msg.ID)
+		if err != nil {
+			log.Printf("[DelayedWorker] сообщение %s не найдено в Redis: %v", msg.ID, err)
+			return nil // пропускаем, чтобы не застревать
+		}
+
+		if cached.Status == "cancelled" || cached.Status == "sent" {
+			log.Printf("[DelayedWorker] задача %s уже %s, пропуск", msg.ID, cached.Status)
+			return nil
+		}
+
+		now := time.Now()
+		if now.Before(msg.RemindAt) {
+			// ещё рано — откладываем повторную проверку
+			delay := int(math.Min(float64(msg.RemindAt.Sub(now).Seconds()), 30))
+			_ = s.queue.Retry(ctx, msg, delay)
+			return nil
+		}
+
+		// переносим задачу в ready очередь
+		if err := s.queue.PublishReady(ctx, msg); err != nil {
+			log.Printf("[DelayedWorker] не удалось перенести %s в ready_queue: %v", msg.ID, err)
+			return err
+		}
+
+		// обновляем статус в Redis
+		cached.Status = "ready"
+		cached.RetryCount = msg.RetryCount
+		cached.UpdatedAt = time.Now()
+		if err := s.cache.Save(ctx, cached); err != nil {
+			log.Printf("[DelayedWorker] ошибка обновления статуса Redis: %v", err)
+		}
+
+		log.Printf("[DelayedWorker] задача %s перенесена в ready очередь", msg.ID)
+		return nil
 	}
 
+	return s.queue.ConsumeDelayed(ctx, handler)
+}
+
+// ExtendTaskDeadline — изменяет время напоминания, если оно ещё не отправлено
+func (s *NotificationService) ExtendTaskDeadline(ctx context.Context, id string, newTime time.Time) error {
+	if len(id) == 0 {
+		return fmt.Errorf("ID задачи обязателен")
+	}
+	if newTime.Before(time.Now()) {
+		return fmt.Errorf("нельзя перенести задачу в прошлое время")
+	}
+
+	msg, err := s.cache.Get(ctx, id)
+	if err != nil {
+		return fmt.Errorf("ошибка получения задачи из Redis: %w", err)
+	}
+
+	if msg.Status == "sent" || msg.Status == "cancelled" {
+		return fmt.Errorf("невозможно изменить дедлайн задачи со статусом %s", msg.Status)
+	}
+
+	msg.RemindAt = newTime
+	msg.RetryCount = 0
+	msg.Status = "pending"
+	msg.Error = ""
+	msg.UpdatedAt = time.Now()
+
+	// обновляем и в RabbitMQ
+	rabbitMsg := &models.RabbitMQMessage{
+		ID:         msg.ID,
+		UserID:     msg.UserID,
+		Text:       msg.Text,
+		RemindAt:   newTime,
+		Status:     "pending",
+		RetryCount: msg.RetryCount,
+		CreatedAt:  msg.CreatedAt,
+		UpdatedAt:  msg.UpdatedAt,
+		Complexity: msg.Complexity,
+		Priority:   msg.Priority,
+		Category:   msg.Category,
+		Notes:      msg.Notes,
+	}
+
+	// публикуем обратно в delayed очередь
+	if err := s.queue.PublishDelayed(ctx, rabbitMsg); err != nil {
+		return fmt.Errorf("ошибка при обновлении очереди delayed: %w", err)
+	}
+
+	if err := s.cache.Save(ctx, msg); err != nil {
+		log.Printf("[ExtendTaskDeadline] не удалось сохранить задачу в Redis: %v", err)
+	}
+
+	log.Printf("[ExtendTaskDeadline] задача %s перенесена на %s", id, newTime.Format(time.RFC3339))
 	return nil
+}
+
+// ListTasksByUser — возвращает все задачи пользователя
+func (s *NotificationService) ListTasksByUser(ctx context.Context, userID string) ([]*models.RedisMessage, error) {
+	if len(userID) == 0 {
+		return nil, fmt.Errorf("userID обязателен")
+	}
+
+	tasks, err := s.cache.ListByUser(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка при получении задач пользователя %s: %w", userID, err)
+	}
+
+	if len(tasks) == 0 {
+		log.Printf("[ListTasksByUser] у пользователя %s нет активных задач", userID)
+	}
+
+	return tasks, nil
 }

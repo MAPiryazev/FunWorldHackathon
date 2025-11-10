@@ -8,7 +8,7 @@ import (
 )
 
 // CacheClient интерфейс для взаимодействия с redis
-type CacheClient interface {
+type CacheClientIface interface {
 	Save(ctx context.Context, message *models.RedisMessage) error
 	SaveWithTTL(ctx context.Context, message *models.RedisMessage, ttl time.Duration) error
 	Get(ctx context.Context, id string) (*models.RedisMessage, error)
@@ -18,7 +18,7 @@ type CacheClient interface {
 }
 
 // QueueMQClient интерфейс для взаимодействия с rabbitmq
-type QueueRepository interface {
+type QueueRepositoryIface interface {
 	PublishDelayed(ctx context.Context, message *models.RabbitMQMessage) error
 	PublishReady(ctx context.Context, message *models.RabbitMQMessage) error
 	ConsumeDelayed(ctx context.Context, handler func(msg *models.RabbitMQMessage) error) error

@@ -22,11 +22,19 @@ type RabbitMQMessage struct {
 
 // RedisMessage хранится в redis, выступает как кеш-хранилище напоминаний
 type RedisMessage struct {
-	ID        string    `json:"id"`
-	UserID    string    `json:"user_id"`    // новый обязательный ключ
-	Status    string    `json:"status"`     // pending | ready | sent | failed | cancelled
-	Error     string    `json:"error"`      // описание ошибки, если есть
-	UpdatedAt time.Time `json:"updated_at"` // когда обновилось
+	ID         string    `json:"id"`
+	UserID     string    `json:"user_id"`     // обязательный ключ для фильтрации по пользователю
+	Text       string    `json:"text"`        // текст задачи / уведомления
+	RemindAt   time.Time `json:"remind_at"`   // время для отправки
+	Status     string    `json:"status"`      // pending | ready | sent | failed | cancelled | rescheduled
+	RetryCount int       `json:"retry_count"` // количество повторных попыток
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+	Error      string    `json:"error"` // описание ошибки, если есть
+	Complexity int       `json:"complexity"`
+	Priority   string    `json:"priority"`
+	Category   string    `json:"category"`
+	Notes      string    `json:"notes"`
 }
 
 // CreateNotificationRequest модель запроса на создание уведомления
