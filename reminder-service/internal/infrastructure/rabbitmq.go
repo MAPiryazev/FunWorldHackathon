@@ -9,8 +9,8 @@ import (
 
 	"github.com/rabbitmq/amqp091-go"
 
-	"L3.1/internal/config"
-	"L3.1/internal/models"
+	"reminder-service/internal/config"
+	"reminder-service/internal/models"
 )
 
 // RabbitMQClient параметры подключения к rabbitmq
@@ -19,39 +19,48 @@ type RabbitMQClient struct {
 	channel *amqp091.Channel
 }
 
-// NewRabbitMQClient конструктор для структуры клиента
-func NewRabbitMQClient(config config.RabbitMQConfig) (*RabbitMQClient, error) {
-	url := fmt.Sprintf("amqp://%s:%s@localhost:5672/", config.User, config.Password)
+// NewRabbitMQClient конструктор для структуры клиента с использованием конфигурации из ENV
+func NewRabbitMQClient(cfg *config.RabbitMQConfig) (*RabbitMQClient, error) {
+	// формируем URL подключения
+	url := fmt.Sprintf("amqp://%s:%s@%s:%s/", cfg.User, cfg.Password, cfg.Host, cfg.Port)
+
 	conn, err := amqp091.Dial(url)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("не удалось подключиться к RabbitMQ: %w", err)
 	}
+
 	ch, err := conn.Channel()
 	if err != nil {
-		return nil, err
+		conn.Close()
+		return nil, fmt.Errorf("не удалось открыть канал RabbitMQ: %w", err)
 	}
+
 	return &RabbitMQClient{
 		conn:    conn,
 		channel: ch,
 	}, nil
 }
 
-// Publish отпрявляет сообщение в rabbitmq и создает очередь если ее нет
-func (rc *RabbitMQClient) Publish(ctx context.Context, queueName string, message *models.RabbitMQMessage) error {
+// publishHelper отпрявляет сообщение в rabbitmq и создает очередь если ее нет
+func (rc *RabbitMQClient) publishHelper(ctx context.Context, queueName string, message *models.RabbitMQMessage) error {
 	if message == nil {
-		return fmt.Errorf("message is nil")
+		return fmt.Errorf("nil сообщение нельзя записать в очередь rabbit")
+	}
+
+	if len(message.UserID) == 0 {
+		return fmt.Errorf("сообщение без UserID нельзя записать в очередь rabbit")
 	}
 
 	data, err := json.Marshal(message)
 	if err != nil {
-		return fmt.Errorf("failed to marshal message: %w", err)
+		return fmt.Errorf("ошибка распаковки сообщения : %w", err)
 	}
 
 	// durable=true → очередь сохранится после рестарта RabbitMQ
 	_, err = rc.channel.QueueDeclare(
 		queueName, true, false, false, false, nil)
 	if err != nil {
-		return fmt.Errorf("failed to declare queue: %w", err)
+		return fmt.Errorf("ошибка объявления очереди: %w", err)
 	}
 
 	err = rc.channel.PublishWithContext(ctx,
@@ -62,108 +71,88 @@ func (rc *RabbitMQClient) Publish(ctx context.Context, queueName string, message
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("failed to publish message: %w", err)
+		return fmt.Errorf("не удалось опубликовать сообщение: %w", err)
 	}
 
 	return nil
 }
 
-// Consume — читает сообщения из очереди и вызывает обработчик для каждого.
-func (rc *RabbitMQClient) Consume(ctx context.Context, queueName string, handler func(msg *models.RabbitMQMessage) error) error {
-	// Создаем очередь если её нет
-	_, err := rc.channel.QueueDeclare(
-		queueName, true, false, false, false, nil,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to declare queue %s: %w", queueName, err)
-	}
+// PublishDelayed — отправляет сообщение в очередь delayed_queue
+func (rc *RabbitMQClient) PublishDelayed(ctx context.Context, message *models.RabbitMQMessage) error {
+	return rc.publishHelper(ctx, "delayed_queue", message)
+}
 
-	log.Printf("[RabbitMQ] Начинаем чтение из очереди: %s", queueName)
+// PublishReady — отправляет сообщение в очередь ready_queue
+func (rc *RabbitMQClient) PublishReady(ctx context.Context, message *models.RabbitMQMessage) error {
+	return rc.publishHelper(ctx, "ready_queue", message)
+}
+
+// универсальный метод consume
+func (rc *RabbitMQClient) consumeHelper(ctx context.Context, queueName string, handler func(msg *models.RabbitMQMessage) error) error {
+	_, err := rc.channel.QueueDeclare(queueName, true, false, false, false, nil)
+	if err != nil {
+		return fmt.Errorf("не удалось объявить очередь %s: %w", queueName, err)
+	}
 
 	msgs, err := rc.channel.Consume(
-		queueName,
-		"", false, false, false, false, nil,
+		queueName, "", false, false, false, false, nil,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to start consuming: %w", err)
+		return fmt.Errorf("не удалось начать потребление очереди %s: %w", queueName, err)
 	}
 
-	log.Printf("[RabbitMQ] Успешно начали чтение из очереди: %s", queueName)
-
+	// запустим горутину для обработки сообщений
 	go func() {
 		for d := range msgs {
-			var m models.RabbitMQMessage
-			if err := json.Unmarshal(d.Body, &m); err != nil {
-				log.Printf("[RabbitMQ] Ошибка парсинга сообщения: %v", err)
-				d.Nack(false, false) // отклоняем без повторной доставки
+			var msg models.RabbitMQMessage
+			if err := json.Unmarshal(d.Body, &msg); err != nil {
+				log.Printf("Ошибка при разборе сообщения: %v", err)
+				d.Nack(false, false)
 				continue
 			}
 
-			log.Printf("[RabbitMQ] Получено сообщение из очереди %s: ID=%s", queueName, m.ID)
-
-			if err := handler(&m); err != nil {
-				log.Printf("[RabbitMQ] Ошибка обработки сообщения ID=%s: %v", m.ID, err)
-				// повторная доставка при ошибке
+			if err := handler(&msg); err != nil {
+				log.Printf("Ошибка обработки сообщения: %v", err)
 				d.Nack(false, true)
 			} else {
-				log.Printf("[RabbitMQ] Сообщение ID=%s успешно обработано", m.ID)
 				d.Ack(false)
 			}
 		}
 	}()
 
-	// блокируем до завершения контекста
-	<-ctx.Done()
-	log.Printf("[RabbitMQ] Чтение из очереди %s остановлено", queueName)
-	return ctx.Err()
+	return nil
 }
 
-// ConsumeSingleMessage — читает одно сообщение из очереди (неблокирующий метод)
-func (rc *RabbitMQClient) ConsumeSingleMessage(ctx context.Context, queueName string) (*models.RabbitMQMessage, error) {
-	_, err := rc.channel.QueueDeclare(
-		queueName, true, false, false, false, nil,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("объявление очереди не удалось: %w", err)
-	}
-
-	msg, ok, err := rc.channel.Get(queueName, false)
-	if err != nil {
-		return nil, fmt.Errorf("не удалось получить сообщение: %w", err)
-	}
-
-	if !ok {
-		// очередь пуста
-		return nil, fmt.Errorf("очередь пуста")
-	}
-
-	var m models.RabbitMQMessage
-	if err := json.Unmarshal(msg.Body, &m); err != nil {
-		msg.Nack(false, true) // возвращаем обратно если не смогли распарсить
-		return nil, fmt.Errorf("не удалось распаковать сообщение: %w", err)
-	}
-
-	// подтверждаем получение сообщения
-	msg.Ack(false)
-
-	return &m, nil
+// ConsumeDelayed — читает сообщения из delayed_queue и вызывает handler
+func (rc *RabbitMQClient) ConsumeDelayed(ctx context.Context, handler func(msg *models.RabbitMQMessage) error) error {
+	return rc.consumeHelper(ctx, "delayed_queue", handler)
 }
 
-// RetryMessage — повторная отправка сообщения через delay.
-func (rc *RabbitMQClient) RetryMessage(ctx context.Context, queueName string, message *models.RabbitMQMessage, delaySeconds int) error {
+// ConsumeReady — читает сообщения из ready_queue и вызывает handler
+func (rc *RabbitMQClient) ConsumeReady(ctx context.Context, handler func(msg *models.RabbitMQMessage) error) error {
+	return rc.consumeHelper(ctx, "ready_queue", handler)
+}
+
+// Retry — отправляет сообщение обратно в очередь с задержкой (через time.AfterFunc)
+func (rc *RabbitMQClient) Retry(ctx context.Context, message *models.RabbitMQMessage, delaySeconds int) error {
 	if message == nil {
-		return fmt.Errorf("message is nil")
+		return fmt.Errorf("сообщение nil")
 	}
-	time.Sleep(time.Duration(delaySeconds) * time.Second)
-	message.RetryCount++
-	return rc.Publish(ctx, queueName, message)
+
+	time.AfterFunc(time.Duration(delaySeconds)*time.Second, func() {
+		if err := rc.PublishDelayed(ctx, message); err != nil {
+			log.Printf("Ошибка повторной отправки сообщения: %v", err)
+		}
+	})
+
+	return nil
 }
 
-// QueueLength — возвращает количество сообщений в очереди.
+// QueueLength — возвращает количество сообщений в очереди
 func (rc *RabbitMQClient) QueueLength(ctx context.Context, queueName string) (int, error) {
-	q, err := rc.channel.QueueInspect(queueName)
+	q, err := rc.channel.QueueDeclarePassive(queueName, true, false, false, false, nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to inspect queue: %w", err)
+		return 0, fmt.Errorf("не удалось получить длину очереди %s: %w", queueName, err)
 	}
-	return q.Messages, nil
+	return int(q.Messages), nil
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"reminder-service/internal/config"
 	"reminder-service/internal/models"
 
 	"github.com/redis/go-redis/v9"
@@ -16,12 +17,13 @@ type RedisClient struct {
 	client *redis.Client
 }
 
-// NewRedisClient — конструктор клиента Redis.
-func NewRedisClient(addr, password string, db int) *RedisClient {
+// NewRedisClientFromConfig создает RedisClient на основе RedisConfig
+func NewRedisClient(cfg *config.RedisConfig) *RedisClient {
+	addr := fmt.Sprintf("%s:%s", cfg.Host, cfg.Port)
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     addr,
-		Password: password,
-		DB:       db,
+		Password: cfg.Password,
+		DB:       cfg.DB,
 	})
 	return &RedisClient{client: rdb}
 }
@@ -150,7 +152,6 @@ func (rc *RedisClient) ListByUser(ctx context.Context, userID string) ([]*models
 				continue // пропускаем битые записи
 			}
 
-			// фильтруем по userID
 			if msg.UserID == userID {
 				results = append(results, &msg)
 			}
