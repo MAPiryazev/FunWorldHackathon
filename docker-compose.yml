@@ -1,0 +1,33 @@
+version: "3.9"
+
+name: reminder-service
+
+services:
+  reminder-rabbitmq:
+    image: rabbitmq:3-management
+    hostname: reminder-rabbitmq
+    container_name: reminder-rabbitmq
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=-rabbit disk_free_limit 536870912
+    volumes:
+      - ./reminder-service/rabbitmq:/var/lib/rabbitmq
+    ports:
+      - 15683:15672   
+      - 5673:5672
+
+  reminder-redis:
+    image: redis:7
+    container_name: reminder-redis
+    restart: always
+    ports:
+      - 6380:6379
+    volumes:
+      - reminder-redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+
+volumes:
+  reminder-redis-data:
+

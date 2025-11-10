@@ -23,6 +23,7 @@ type RabbitMQMessage struct {
 // RedisMessage хранится в redis, выступает как кеш-хранилище напоминаний
 type RedisMessage struct {
 	ID        string    `json:"id"`
+	UserID    string    `json:"user_id"`    // новый обязательный ключ
 	Status    string    `json:"status"`     // pending | ready | sent | failed | cancelled
 	Error     string    `json:"error"`      // описание ошибки, если есть
 	UpdatedAt time.Time `json:"updated_at"` // когда обновилось

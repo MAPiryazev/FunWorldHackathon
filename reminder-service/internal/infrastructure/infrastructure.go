@@ -2,24 +2,27 @@ package infrastructure
 
 import (
 	"context"
+	"time"
 
-	"L3.1/internal/models"
+	"reminder-service/internal/models"
 )
 
 // CacheClient интерфейс для взаимодействия с redis
 type CacheClient interface {
-	Set(ctx context.Context, key string, message *models.RedisMessage) error
-	SetWithTTL(ctx context.Context, key string, message *models.RedisMessage, ttlSeconds int) error
-	Get(ctx context.Context, key string) (*models.RedisMessage, error)
-	Exists(ctx context.Context, key string) (bool, error)
-	Delete(ctx context.Context, key string) error
+	Save(ctx context.Context, message *models.RedisMessage) error
+	SaveWithTTL(ctx context.Context, message *models.RedisMessage, ttl time.Duration) error
+	Get(ctx context.Context, id string) (*models.RedisMessage, error)
+	Exists(ctx context.Context, id string) (bool, error)
+	Delete(ctx context.Context, id string) error
+	ListByUser(ctx context.Context, userID string) ([]*models.RedisMessage, error)
 }
 
 // QueueMQClient интерфейс для взаимодействия с rabbitmq
-type QueueMQClient interface {
-	Publish(ctx context.Context, queueName string, message *models.RabbitMQMessage) error
-	Consume(ctx context.Context, queueName string, handler func(msg *models.RabbitMQMessage) error) error
-	ConsumeSingleMessage(ctx context.Context, queueName string) (*models.RabbitMQMessage, error)
-	RetryMessage(ctx context.Context, queueName string, message *models.RabbitMQMessage, delaySecons int) error
+type QueueRepository interface {
+	PublishDelayed(ctx context.Context, message *models.RabbitMQMessage) error
+	PublishReady(ctx context.Context, message *models.RabbitMQMessage) error
+	ConsumeDelayed(ctx context.Context, handler func(msg *models.RabbitMQMessage) error) error
+	ConsumeReady(ctx context.Context, handler func(msg *models.RabbitMQMessage) error) error
+	Retry(ctx context.Context, message *models.RabbitMQMessage, delaySeconds int) error
 	QueueLength(ctx context.Context, queueName string) (int, error)
 }
