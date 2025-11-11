@@ -285,7 +285,12 @@ func (s *NotificationService) StartDelayedWorker(ctx context.Context) error {
 		now := time.Now()
 		if now.Before(msg.RemindAt) {
 			// ещё рано — откладываем повторную проверку
-			delay := int(math.Min(float64(msg.RemindAt.Sub(now).Seconds()), 30))
+			secondsUntil := msg.RemindAt.Sub(now).Seconds()
+			// используем потолок, чтобы избежать нулевых значений при дробных секундах
+			delay := int(math.Ceil(math.Min(secondsUntil, 30)))
+			if delay < 1 {
+				delay = 1
+			}
 			_ = s.queue.Retry(ctx, msg, delay)
 			return nil
 		}

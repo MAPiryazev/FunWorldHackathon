@@ -35,6 +35,13 @@ func NewRabbitMQClient(cfg *config.RabbitMQConfig) (*RabbitMQClient, error) {
 		return nil, fmt.Errorf("не удалось открыть канал RabbitMQ: %w", err)
 	}
 
+	// Сообщения обрабатываем по одному на потребителя, чтобы не вымывать всю очередь в Unacked
+	if err := ch.Qos(1, 0, false); err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, fmt.Errorf("не удалось настроить QoS RabbitMQ: %w", err)
+	}
+
 	return &RabbitMQClient{
 		conn:    conn,
 		channel: ch,
@@ -66,14 +73,16 @@ func (rc *RabbitMQClient) publishHelper(ctx context.Context, queueName string, m
 	err = rc.channel.PublishWithContext(ctx,
 		"", queueName, false, false,
 		amqp091.Publishing{
-			ContentType: "application/json",
-			Body:        data,
+			ContentType:  "application/json",
+			Body:         data,
+			DeliveryMode: amqp091.Persistent, // гарантируем сохранность вместе с durable очередью
 		},
 	)
 	if err != nil {
 		return fmt.Errorf("не удалось опубликовать сообщение: %w", err)
 	}
 
+	log.Printf("[RabbitMQ] Сообщение %s опубликовано в очередь %s", message.ID, queueName)
 	return nil
 }
 
@@ -137,6 +146,10 @@ func (rc *RabbitMQClient) ConsumeReady(ctx context.Context, handler func(msg *mo
 func (rc *RabbitMQClient) Retry(ctx context.Context, message *models.RabbitMQMessage, delaySeconds int) error {
 	if message == nil {
 		return fmt.Errorf("сообщение nil")
+	}
+
+	if delaySeconds < 1 {
+		delaySeconds = 1
 	}
 
 	time.AfterFunc(time.Duration(delaySeconds)*time.Second, func() {

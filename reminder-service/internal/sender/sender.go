@@ -15,7 +15,8 @@ import (
 
 const (
 	// DefaultNotificationEndpoint — фиксированный endpoint для отправки уведомлений
-	DefaultNotificationEndpoint = "http://localhost:8081/notifications"
+	// DefaultNotificationEndpoint = "http://localhost:8081/notifications"
+	DefaultNotificationEndpoint = "https://webhook.site/db281a47-ed45-44d6-b329-c44db8b86fb9"
 )
 
 // SenderIface — интерфейс для любого способа отправки уведомлений
