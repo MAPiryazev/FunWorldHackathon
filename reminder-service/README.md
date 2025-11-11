@@ -146,11 +146,4 @@ docker-compose up --build -d
 
 ---
 
-## Конфигурация
-
-Переменные окружения (`.env`):
-- `RABBITMQ_HOST`, `RABBITMQ_PORT`, `RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS`
-- `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`
-- `API_HOST`, `API_PORT`
-
-Endpoint для отправки уведомлений фиксирован в коде: `http://localhost:8081/notifications` (можно изменить в `internal/sender/sender.go`)
+Endpoint для отправки в env: `http://localhost:8081/notifications` (можно изменить в `.env`)

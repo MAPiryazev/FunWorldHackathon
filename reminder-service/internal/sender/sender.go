@@ -15,8 +15,7 @@ import (
 
 const (
 	// DefaultNotificationEndpoint — фиксированный endpoint для отправки уведомлений
-	// DefaultNotificationEndpoint = "http://localhost:8081/notifications"
-	DefaultNotificationEndpoint = "https://webhook.site/db281a47-ed45-44d6-b329-c44db8b86fb9"
+	DefaultNotificationEndpoint = "http://localhost:8081/notifications"
 )
 
 // SenderIface — интерфейс для любого способа отправки уведомлений
@@ -30,17 +29,27 @@ type HTTPSender struct {
 	endpointURL string
 }
 
-// NewHTTPSender создает новый HTTPSender с фиксированным endpoint
+// NewHTTPSender создает новый HTTPSender с фиксированным endpoint (по умолчанию)
 func NewHTTPSender(timeout time.Duration) *HTTPSender {
+	return NewHTTPSenderWithEndpoint(timeout, "")
+}
+
+// NewHTTPSenderWithEndpoint создает новый HTTPSender с возможностью передать endpoint из конфигурации/ENV
+// Если endpoint пустой, используется DefaultNotificationEndpoint
+func NewHTTPSenderWithEndpoint(timeout time.Duration, endpoint string) *HTTPSender {
 	if timeout == 0 {
 		timeout = 10 * time.Second
+	}
+
+	if endpoint == "" {
+		endpoint = DefaultNotificationEndpoint
 	}
 
 	return &HTTPSender{
 		client: &http.Client{
 			Timeout: timeout,
 		},
-		endpointURL: DefaultNotificationEndpoint,
+		endpointURL: endpoint,
 	}
 }
 

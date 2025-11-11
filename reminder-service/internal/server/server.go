@@ -42,9 +42,16 @@ func InitNotificationService(envPath string) (*service.NotificationService, erro
 		return nil, fmt.Errorf("ошибка подключения к RabbitMQ: %w", err)
 	}
 
-	// Используем HTTPSender с фиксированным endpoint
-	httpSender := sender.NewHTTPSender(10 * time.Second)
-	log.Printf("[Server] Используется HTTPSender для отправки на %s", sender.DefaultNotificationEndpoint)
+	// Загружаем конфиг для отправки уведомлений (endpoint из ENV)
+	notificationCfg, _ := config.LoadNotificationConfig(envPath)
+	endpoint := notificationCfg.Endpoint
+	if endpoint == "" {
+		endpoint = sender.DefaultNotificationEndpoint
+	}
+
+	// Используем HTTPSender с endpoint из ENV (если пусто — дефолт)
+	httpSender := sender.NewHTTPSenderWithEndpoint(10*time.Second, endpoint)
+	log.Printf("[Server] Используется HTTPSender для отправки на %s", endpoint)
 
 	notificationService, err := service.NewNotificationService(
 		redisClient,
