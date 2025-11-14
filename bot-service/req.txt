@@ -1,0 +1,7 @@
+﻿fastapi[all]
+httpx
+pydantic
+pydantic-settings
+maxapi
+maxapi[webhook]
+pytz

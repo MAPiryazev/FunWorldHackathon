@@ -1,0 +1,112 @@
+services:
+  reminder-rabbitmq:
+    image: rabbitmq:3-management
+    hostname: reminder-rabbitmq
+    container_name: reminder-rabbitmq
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=-rabbit disk_free_limit 536870912
+    volumes:
+      - reminder-rabbitmq-data:/var/lib/rabbitmq
+    ports:
+      - 15683:15672
+      - 5673:5672
+    networks:
+      - reminder-network
+
+  reminder-redis:
+    image: redis:7
+    container_name: reminder-redis
+    restart: always
+    ports:
+      - 6380:6379
+    volumes:
+      - reminder-redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    networks:
+      - reminder-network
+
+  reminder-service:
+    build:
+      context: ./reminder-service
+      dockerfile: Dockerfile
+    container_name: reminder-service
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - RABBITMQ_HOST=reminder-rabbitmq
+      - RABBITMQ_PORT=5672
+      - REDIS_HOST=reminder-redis
+      - REDIS_PORT=6379
+      - NOTIFICATION_ENDPOINT=http://bot-service:8080/notifications
+      - API_SENDER_ENDPOINT=http://bot-service:8080/notifications
+      - TZ=Europe/Moscow
+    ports:
+      - "8907:8080"
+    volumes:
+      - ./.env:/app/.env:ro
+    depends_on:
+      reminder-rabbitmq:
+        condition: service_started
+      reminder-redis:
+        condition: service_started
+    networks:
+      - reminder-network
+
+  nlp-service:
+    build:
+      context: ./nlp-service
+      dockerfile: Dockerfile
+    container_name: nlp-service
+    restart: always
+    env_file:
+      - nlp-service/.env
+      - .env
+    environment:
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - TZ=Europe/Moscow
+    expose:
+      - "8000"
+    depends_on:
+      reminder-rabbitmq:
+        condition: service_started
+    networks:
+      - reminder-network
+
+  bot-service:
+    build:
+      context: ./bot-service
+    container_name: bot-service
+    restart: always
+    env_file:
+      - bot-service/.env
+      - .env
+    environment:
+      - NLP_SERVICE_URL=http://nlp-service:8000
+      - REMINDER_SERVICE_URL=http://reminder-service:8080
+      - TUNA_AUTOSTART=true
+      - TUNA_TOKEN=tt_fseepyzity6v3g4kjj6ae8e21albvsig
+      - BOT_PORT=8080
+      - TZ=Europe/Moscow
+    ports:
+      - "8080:8080"
+    depends_on:
+      nlp-service:
+        condition: service_started
+      reminder-service:
+        condition: service_started
+    networks:
+      - reminder-network
+
+networks:
+  reminder-network:
+    driver: bridge
+
+volumes:
+  reminder-redis-data:
+  reminder-rabbitmq-data:
+
